@@ -1,0 +1,686 @@
+import gradio as gr
+
+# ── DATA ──────────────────────────────────────────────────────────────────────
+FUEL_TABLE = {
+    "Pipe Natural Gas":              {"rate": 50, "sf_ratio": 12, "boiler_eff": 0.85, "co2_factor": 56100},
+    "Liquefied Petroleum Gas (LPG)": {"rate": 95, "sf_ratio": 15, "boiler_eff": 0.85, "co2_factor": 63100},
+    "Diesel Fuel":                   {"rate": 90, "sf_ratio": 14, "boiler_eff": 0.85, "co2_factor": 74100},
+    "Fuel Oil (Furnace Oil)":        {"rate": 55, "sf_ratio": 13, "boiler_eff": 0.85, "co2_factor": 77400},
+    "Coal":                          {"rate": 12, "sf_ratio": 6,  "boiler_eff": 0.75, "co2_factor": 94600},
+    "Biomass":                       {"rate": 8,  "sf_ratio": 4,  "boiler_eff": 0.75, "co2_factor": 0},
+}
+
+BOUNDS = {
+    "Hot Water IN (°C)":      (20,  75),
+    "Hot Water OUT (°C)":     (25,  80),
+    "Cold Water IN (°C)":     (10,  40),
+    "Cold Water OUT (°C)":    (7,   40),
+    "Daily Operating Hours":  (0.1, 24),
+    "Operating Days / Year":  (1,  360),
+}
+
+def check_bounds(label, value):
+    lo, hi = BOUNDS[label]
+    if not (lo <= value <= hi):
+        return f"{label} is out of range — valid range is {lo} to {hi}."
+    return None
+
+def get_steam_cost_from_fuel(fuel_name):
+    f = FUEL_TABLE[fuel_name]
+    return round(f["rate"] / f["sf_ratio"], 4)
+
+def _err(msg):
+    return (f"<div style='background:#FFF4CE;border-left:3px solid #E66C37;"
+            f"padding:12px 16px;border-radius:2px;color:#603000;font-size:13px;"
+            f"font-family:Segoe UI,system-ui,sans-serif'>{msg}</div>")
+
+# ── CALCULATION ───────────────────────────────────────────────────────────────
+def calculate(medium, mode, process_type, heating_type,
+              hot_water_in, hot_water_out, flow_rate,
+              cold_water_in, cold_water_out,
+              daily_op_hours, op_days,
+              steam_cost_known, steam_cost_manual, fuel_type,
+              fuel_type_co2,
+              electricity_tariff, ikw_tr):
+
+    try:
+        hot_water_in       = float(hot_water_in)
+        hot_water_out      = float(hot_water_out)
+        flow_rate          = float(flow_rate)
+        cold_water_in      = float(cold_water_in)
+        daily_op_hours     = float(daily_op_hours)
+        op_days            = float(op_days)
+        electricity_tariff = float(electricity_tariff)
+    except (ValueError, TypeError):
+        return _err("Please fill in all required numeric fields."), "", ""
+
+    for label, val in [
+        ("Hot Water IN (°C)",     hot_water_in),
+        ("Hot Water OUT (°C)",    hot_water_out),
+        ("Cold Water IN (°C)",    cold_water_in),
+        ("Daily Operating Hours", daily_op_hours),
+        ("Operating Days / Year", op_days),
+    ]:
+        err = check_bounds(label, val)
+        if err:
+            return _err(err), "", ""
+
+    is_hc = (medium == "Water" and mode == "Heating + Cooling")
+
+    if is_hc:
+        try:
+            cold_water_out = float(cold_water_out)
+            ikw_tr         = float(ikw_tr)
+        except (ValueError, TypeError):
+            return _err("Please fill Cold Water Out Temp and IKW/TR for Heating + Cooling mode."), "", ""
+        err = check_bounds("Cold Water OUT (°C)", cold_water_out)
+        if err:
+            return _err(err), "", ""
+        if cold_water_out >= cold_water_in:
+            return _err(f"Cold Water OUT ({cold_water_out}°C) must be less than Cold Water IN ({cold_water_in}°C) — the heat pump extracts heat from the cold side, so it must leave colder."), "", ""
+    else:
+        cold_water_out = 0
+        ikw_tr         = 0.95
+
+    if steam_cost_known == "I know the steam cost":
+        try:
+            steam_cost = float(steam_cost_manual)
+        except (ValueError, TypeError):
+            return _err("Please enter a valid steam cost."), "", ""
+    else:
+        if not fuel_type:
+            return _err("Please select a fuel type to auto-calculate steam cost."), "", ""
+        steam_cost = get_steam_cost_from_fuel(fuel_type)
+
+    if process_type == "Per Day":
+        if daily_op_hours <= 0:
+            return _err("Daily operating hours must be > 0."), "", ""
+        flow_rate = flow_rate / daily_op_hours
+
+    # ── core thermodynamics ───────────────────────────────────────────────────
+    heat_duty_kcal = flow_rate * (hot_water_out - hot_water_in)
+
+    if heating_type == "Indirect Heating":
+        steam_required = heat_duty_kcal / 526
+    else:
+        denom = 663 - hot_water_in
+        if denom == 0:
+            return _err("663 - Hot Water IN Temp = 0, division by zero."), "", ""
+        steam_required = heat_duty_kcal / denom
+
+    heat_duty_kwth         = heat_duty_kcal / 860
+    hourly_steam_savings_A = steam_required * steam_cost
+
+    if (hot_water_out - cold_water_in) == 0:
+        return _err("(Hot Water Out - Cold Water In) = 0, COP undefined."), "", ""
+
+    cop_factor       = 0.35 if hot_water_out <= 65 else 0.32
+    cop              = ((hot_water_out + 273) / (hot_water_out - cold_water_in)) * cop_factor
+    electrical_power = heat_duty_kwth / cop
+    hourly_op_cost_B = electrical_power * electricity_tariff
+
+    if is_hc:
+        cooling_output_kw        = heat_duty_kwth - electrical_power
+        electricity_reduction    = (cooling_output_kw / 3.5) * ikw_tr
+        hourly_cooling_savings_C = electricity_reduction * electricity_tariff
+        net_savings_hr           = hourly_steam_savings_A + hourly_cooling_savings_C - hourly_op_cost_B
+    else:
+        cooling_output_kw = electricity_reduction = hourly_cooling_savings_C = 0
+        net_savings_hr    = hourly_steam_savings_A - hourly_op_cost_B
+
+    annual_savings     = op_days * daily_op_hours * net_savings_hr
+    heat_pump_capacity = heat_duty_kwth * 1.2
+
+    # ── CO2 mitigation ────────────────────────────────────────────────────────
+    # determine which fuel to use for CO2 (auto mode uses fuel_type, manual uses fuel_type_co2)
+    co2_fuel = fuel_type if steam_cost_known != "I know the steam cost" else fuel_type_co2
+    has_co2  = bool(co2_fuel) and co2_fuel in FUEL_TABLE
+
+    if has_co2:
+        co2_factor            = FUEL_TABLE[co2_fuel]["co2_factor"]          # kg CO2 / TJ
+        kj_energy_year        = heat_duty_kcal * 4.18 * daily_op_hours * op_days
+        terajoule_year        = kj_energy_year / 1_000_000_000
+        tonnes_co2            = terajoule_year * co2_factor / 1000
+        equivalent_trees      = tonnes_co2 * 1000 / 22
+        equivalent_forestation = equivalent_trees / 400
+    else:
+        tonnes_co2 = equivalent_trees = equivalent_forestation = 0
+
+    # fuel label for display
+    fuel_display = fuel_type if steam_cost_known != "I know the steam cost" else ""
+    fuel_info    = f"({fuel_display} @ Rs.{round(steam_cost,2)}/kg)" if fuel_display else ""
+
+    def fi(v):      return f"{int(round(v)):,}"
+    def ff(v, d=2): return f"{v:,.{d}f}"
+
+    # ── KPI CARDS — new layout ────────────────────────────────────────────────
+    # Row 1: Annual Savings | CO2 Mitigation | Steam Savings/yr
+    # Row 2: Heat Pump Capacity | Equivalent Forestation
+    # Row 3: Fuel Savings (A) | Elec Cost (B) | Net Savings/hr
+
+    steam_savings_yr_tonnes = (steam_required * daily_op_hours * op_days) / 1000  # kg/hr → T/year
+
+    co2_card_val  = f"{ff(tonnes_co2)} T/yr"   if has_co2 else "—"
+    tree_card_val = f"{fi(equivalent_trees)}"   if has_co2 else "—"
+    fore_card_val = f"{ff(equivalent_forestation)} ACRs" if has_co2 else "—"
+    co2_note      = f"<div style='font-size:10px;color:#A19F9D;margin-top:3px'>{co2_fuel}</div>" if has_co2 else "<div style='font-size:10px;color:#A19F9D;margin-top:3px'>Select fuel type for CO₂ data</div>"
+
+    def card(bg, accent, label, value, unit, tag_bg, tag_color, tag_text, extra=""):
+        return f"""<div style='background:#FFFFFF;border-radius:4px;padding:16px 16px 14px;
+              border-top:3px solid {accent};box-shadow:0 1px 4px rgba(0,0,0,.08)'>
+    <div style='font-size:10px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;
+                color:#605E5C;margin-bottom:6px;font-family:Segoe UI,sans-serif'>{label}</div>
+    <div style='font-size:22px;font-weight:700;color:#201F1E;line-height:1.1;
+                font-family:Segoe UI,sans-serif'>{value}</div>
+    <div style='font-size:11px;color:#8A8886;margin-top:4px;font-family:Segoe UI,sans-serif'>{unit}</div>
+    {extra}
+    <div style='display:inline-block;margin-top:8px;background:{tag_bg};color:{tag_color};
+                font-size:10px;font-weight:700;padding:2px 8px;border-radius:2px;
+                font-family:Segoe UI,sans-serif;letter-spacing:.06em'>{tag_text}</div>
+  </div>"""
+
+    def small_card(accent, label, value):
+        return f"""<div style='background:#FFFFFF;border-radius:4px;padding:12px 16px;
+              border-left:3px solid {accent};box-shadow:0 1px 4px rgba(0,0,0,.08)'>
+    <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+                color:#605E5C;font-family:Segoe UI,sans-serif'>{label}</div>
+    <div style='font-size:17px;font-weight:700;color:{accent};margin-top:4px;
+                font-family:Segoe UI,sans-serif'>{value}</div>
+  </div>"""
+
+    kpi = f"""
+<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px'>
+  {card('#F8F8F8','#118DFF','Annual Savings',f'Rs.{fi(annual_savings)}','Rs. / Year','#DEEEFF','#0063B1','NET BENEFIT')}
+  {card('#F8F8F8','#107C10','CO₂ Mitigation',co2_card_val,'Tonnes / Year','#E6F4EA','#107C10','ENVIRONMENT',co2_note)}
+  {card('#F8F8F8','#00B7C3','Steam Savings',ff(steam_savings_yr_tonnes),'Tonnes / Year','#D9F4F5','#006B6E','STEAM SAVED')}
+</div>
+<div style='display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:8px'>
+  {card('#F8F8F8','#E66C37','Heat Pump Capacity',fi(heat_pump_capacity),'kWth','#FDEBD7','#8C3800','REQUIRED')}
+  {card('#F8F8F8','#6B4CC0','Equivalent Forestation',fore_card_val,'ACRs','#EDE7F6','#4527A0','ECO IMPACT',f"<div style='font-size:10px;color:#A19F9D;margin-top:3px'>{'≈ '+fi(equivalent_trees)+' trees' if has_co2 else 'Select fuel type for data'}</div>")}
+</div>
+<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px'>
+  {small_card('#118DFF','Fuel Savings (A)','Rs.'+fi(hourly_steam_savings_A)+'/hr')}
+  {small_card('#E66C37','Elec. Cost (B)','Rs.'+fi(hourly_op_cost_B)+'/hr')}
+  {small_card('#F2C811','Net Savings / Hr','Rs.'+fi(net_savings_hr)+'/hr')}
+</div>
+"""
+
+    # ── DETAIL TABLE ──────────────────────────────────────────────────────────
+    def sec(title):
+        return (f"<tr><td colspan='3' style='padding:7px 12px 6px;font-size:10px;font-weight:600;"
+                f"letter-spacing:.1em;text-transform:uppercase;color:#605E5C;background:#F3F2F1;"
+                f"border-top:1px solid #EDEBE9;font-family:Segoe UI,sans-serif'>{title}</td></tr>")
+
+    def dr(label, val, unit, color=None, bold=False):
+        vc = color if color else "#201F1E"
+        fw = "600" if bold else "400"
+        return (f"<tr style='border-bottom:1px solid #EDEBE9'>"
+                f"<td style='padding:7px 12px;font-size:12px;color:#605E5C;font-family:Segoe UI,sans-serif;width:54%'>{label}</td>"
+                f"<td style='padding:7px 12px;font-size:12px;color:{vc};font-weight:{fw};text-align:right;font-family:Segoe UI,sans-serif;width:30%'>{val}</td>"
+                f"<td style='padding:7px 12px;font-size:11px;color:#A19F9D;text-align:right;font-family:Segoe UI,sans-serif;width:16%'>{unit}</td>"
+                f"</tr>")
+
+    tbl  = ("<table style='width:100%;border-collapse:collapse;background:#FFFFFF;border-radius:4px;"
+            "overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08);font-family:Segoe UI,sans-serif'>")
+    tbl += (f"<tr style='background:#F3F2F1'>"
+            f"<th style='padding:8px 12px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#605E5C;text-align:left'>Parameter</th>"
+            f"<th style='padding:8px 12px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#605E5C;text-align:right'>Value</th>"
+            f"<th style='padding:8px 12px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#605E5C;text-align:right'>Unit</th></tr>")
+
+    tbl += sec("Inputs")
+    tbl += dr("Hot Water IN / OUT",      f"{fi(hot_water_in)} / {fi(hot_water_out)}", "°C")
+    tbl += dr("Flow Rate",               fi(flow_rate),                                "Kg/Hr")
+    cold_lbl = "Cold Water IN / OUT" if is_hc else "Cold Water IN"
+    cold_val = f"{fi(cold_water_in)} / {fi(cold_water_out)}" if is_hc else fi(cold_water_in)
+    tbl += dr(cold_lbl, cold_val, "°C")
+    tbl += dr("Operating Schedule",      f"{fi(daily_op_hours)} hrs x {fi(op_days)} days", "")
+    tbl += dr("Total Operating Hours",   f"{fi(daily_op_hours)} × {fi(op_days)} = {fi(daily_op_hours * op_days)}", "hrs/year", "#118DFF", True)
+    tbl += dr(f"Steam Cost {fuel_info}", f"Rs.{ff(steam_cost)}", "Rs./Kg")
+    tbl += dr("Electricity Tariff",      f"Rs.{ff(electricity_tariff)}", "Rs./kWh")
+
+    tbl += sec("Fuel Savings")
+    tbl += dr("Heat Duty",               fi(heat_duty_kcal),                   "kCal/Hr")
+    tbl += dr("Heat Duty",               fi(heat_duty_kwth),                   "kWth")
+    tbl += dr("Steam Required",          ff(steam_required),                   "Kg/Hr")
+    tbl += dr("Heating COP",             ff(cop),                              "")
+    tbl += dr("Hourly Steam Savings (A)",f"Rs.{fi(hourly_steam_savings_A)}",   "Rs./Hr", "#0063B1", True)
+
+    tbl += sec("Electricity Operating Cost")
+    tbl += dr("Electrical Power",        fi(electrical_power),                 "kWhe")
+    tbl += dr("Hourly Operating Cost (B)",f"Rs.{fi(hourly_op_cost_B)}",        "Rs./Hr", "#8C3800", True)
+
+    if is_hc:
+        tbl += sec("Cooling Electricity Reduction")
+        tbl += dr("Cooling Output",             fi(cooling_output_kw),                "kWth")
+        tbl += dr("IKW/TR",                     ff(ikw_tr),                           "IKW/TR")
+        tbl += dr("Hourly Cooling Savings (C)", f"Rs.{fi(hourly_cooling_savings_C)}", "Rs./Hr", "#006B6E", True)
+
+    tbl += sec("Net Savings")
+    net_lbl = "Net Savings (A + C - B)" if is_hc else "Net Savings (A - B)"
+    tbl += dr(net_lbl,         f"Rs.{fi(net_savings_hr)}",  "Rs./Hr", "#6B4900", True)
+    tbl += dr("Annual Savings",f"Rs.{fi(annual_savings)}",  "Rs./Year","#6B4900", True)
+
+    if has_co2:
+        tbl += sec("CO₂ Mitigation")
+        tbl += dr("Fuel Type",                co2_fuel,                        "")
+        tbl += dr("CO₂ Emission Factor",      f"{FUEL_TABLE[co2_fuel]['co2_factor']:,}", "kg CO₂/TJ")
+        tbl += dr("Energy (KJ/Year)",         fi(kj_energy_year),              "KJ/yr")
+        tbl += dr("Energy (TJ/Year)",         ff(terajoule_year, 4),           "TJ/yr")
+        tbl += dr("Tonnes of CO₂ Mitigated",  ff(tonnes_co2),                  "T/yr",  "#107C10", True)
+        tbl += dr("Equivalent Tree Plantation",fi(equivalent_trees),           "nos.",  "#107C10", True)
+        tbl += dr("Equivalent Forestation",   ff(equivalent_forestation),      "ACRs",  "#4527A0", True)
+
+    tbl += "</table>"
+    detail_html = f"<div>{tbl}</div>"
+
+    # ── STEAM REFERENCE TABLE ─────────────────────────────────────────────────
+    steam_rows = ""
+    for fname, fd in FUEL_TABLE.items():
+        sc     = fd["rate"] / fd["sf_ratio"]
+        is_sel = (steam_cost_known != "I know the steam cost" and fuel_type == fname)
+        row_bg = "#E6F4EA" if is_sel else "#FFFFFF"
+        dot    = ("<span style='display:inline-block;width:6px;height:6px;border-radius:50%;"
+                  "background:#107C10;margin-right:8px;vertical-align:middle'></span>") if is_sel else ""
+        steam_rows += (f"<tr style='border-bottom:1px solid #EDEBE9;background:{row_bg}'>"
+                       f"<td style='padding:7px 12px;font-size:12px;color:#323130;font-family:Segoe UI,sans-serif'>{dot}{fname}</td>"
+                       f"<td style='padding:7px 12px;font-size:12px;color:#605E5C;text-align:right;font-family:Segoe UI,sans-serif'>Rs.{fd['rate']}</td>"
+                       f"<td style='padding:7px 12px;font-size:12px;color:#107C10;font-weight:600;text-align:right;font-family:Segoe UI,sans-serif'>Rs.{sc:.4f}</td>"
+                       f"<td style='padding:7px 12px;font-size:11px;color:#A19F9D;text-align:right;font-family:Segoe UI,sans-serif'>{fd['co2_factor']:,} kg CO₂/TJ</td>"
+                       f"</tr>")
+
+    steam_html = (f"<table style='width:100%;border-collapse:collapse;background:#FFFFFF;border-radius:4px;"
+                  f"overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08);font-family:Segoe UI,sans-serif'>"
+                  f"<tr style='background:#F3F2F1'>"
+                  f"<th style='padding:8px 12px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#605E5C;text-align:left'>Fuel Type</th>"
+                  f"<th style='padding:8px 12px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#605E5C;text-align:right'>Rate</th>"
+                  f"<th style='padding:8px 12px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#605E5C;text-align:right'>Steam Cost</th>"
+                  f"<th style='padding:8px 12px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#605E5C;text-align:right'>CO₂ Factor</th>"
+                  f"</tr>{steam_rows}</table>")
+
+    # ── DOWNLOAD REPORT ───────────────────────────────────────────────────────
+    co2_section_html = ""
+    if has_co2:
+        co2_section_html = f"""
+    <div style='margin-bottom:20px'>
+      <div style='font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+                  color:#605E5C;padding:9px 14px;background:#F3F2F1;border-radius:2px 2px 0 0;
+                  border-bottom:1px solid #EDEBE9'>CO₂ Mitigation</div>
+      <div style='background:#FFFFFF;border-radius:0 0 2px 2px;box-shadow:0 1px 4px rgba(0,0,0,.08);
+                  display:grid;grid-template-columns:repeat(3,1fr);gap:0'>
+        <div style='padding:12px 16px;border-right:1px solid #EDEBE9'>
+          <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Tonnes of CO₂ Mitigated</div>
+          <div style='font-size:20px;font-weight:700;color:#107C10'>{ff(tonnes_co2)} T/yr</div>
+        </div>
+        <div style='padding:12px 16px;border-right:1px solid #EDEBE9'>
+          <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Equivalent Tree Plantation</div>
+          <div style='font-size:20px;font-weight:700;color:#107C10'>{fi(equivalent_trees)} nos.</div>
+        </div>
+        <div style='padding:12px 16px'>
+          <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Equivalent Forestation</div>
+          <div style='font-size:20px;font-weight:700;color:#4527A0'>{ff(equivalent_forestation)} ACRs</div>
+        </div>
+      </div>
+    </div>"""
+
+    report_body = f"""<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='UTF-8'>
+<title>Heat Pump Savings Report — Forbes Marshall</title>
+<style>
+  body{{font-family:Segoe UI,system-ui,sans-serif;background:#F8F8F8;margin:0;padding:0;color:#201F1E}}
+  .nav{{background:#1B1A19;padding:12px 32px;display:flex;align-items:center;gap:10px}}
+  .nav-title{{font-size:15px;font-weight:600;color:#F3F2F1}}
+  .nav-brand{{font-size:15px;font-weight:700;color:#F2C811}}
+  .nav-sub{{font-size:12px;color:#8A8886;margin-left:12px}}
+  .canvas{{max-width:960px;margin:32px auto;padding:0 24px}}
+  .kpi-grid3{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:12px}}
+  .kpi-grid2{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:12px}}
+  .kpi-card{{background:#FFF;border-radius:4px;padding:18px;border-top:3px solid var(--ac);box-shadow:0 1px 4px rgba(0,0,0,.08)}}
+  .kpi-lbl{{font-size:10px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:#605E5C;margin-bottom:8px}}
+  .kpi-val{{font-size:20px;font-weight:700;color:#201F1E;line-height:1.1}}
+  .kpi-unit{{font-size:11px;color:#8A8886;margin-top:5px}}
+  .kpi-tag{{display:inline-block;margin-top:8px;font-size:10px;font-weight:700;padding:2px 8px;border-radius:2px}}
+  .sm-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px}}
+  .sm-card{{background:#FFF;border-radius:4px;padding:12px 16px;border-left:3px solid var(--ac);box-shadow:0 1px 4px rgba(0,0,0,.08)}}
+  .sm-lbl{{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#605E5C}}
+  .sm-val{{font-size:16px;font-weight:700;color:var(--ac);margin-top:4px}}
+  .sec-lbl{{font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#605E5C;background:#F3F2F1;padding:7px 12px;border-top:1px solid #EDEBE9}}
+  table{{width:100%;border-collapse:collapse;background:#FFF;border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:16px;overflow:hidden}}
+  th{{padding:8px 12px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#605E5C;background:#F3F2F1;text-align:left}}
+  th.r{{text-align:right}}
+  td{{padding:7px 12px;font-size:12px;border-bottom:1px solid #EDEBE9;color:#323130}}
+  td.r{{text-align:right}}
+  td.u{{text-align:right;font-size:11px;color:#A19F9D}}
+  .note{{background:#FFF4CE;border-left:3px solid #F2C811;padding:10px 14px;border-radius:2px;font-size:11px;color:#603000;margin-bottom:16px}}
+  .footer{{font-size:10px;color:#A19F9D;text-align:center;padding:24px 0 32px;border-top:1px solid #EDEBE9;margin-top:8px}}
+</style>
+</head>
+<body>
+<div class='nav'>
+  <span class='nav-brand'>Forbes Marshall</span>
+  <span style='color:#3B3A39;margin:0 8px'>|</span>
+  <span class='nav-title'>Heat Pump Savings Calculator</span>
+  <span class='nav-sub'>Reference Report</span>
+</div>
+<div class='canvas'>
+  <div class='note'>
+    This is a reference report for indicative purposes only. For precise calculations and project proposals, please contact the authorised owner.
+  </div>
+  <!-- Inputs Summary -->
+  <div style='margin-bottom:20px'>
+    <div style='font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+                color:#605E5C;padding:9px 14px;background:#F3F2F1;border-radius:2px 2px 0 0;
+                border-bottom:1px solid #EDEBE9'>Configuration &amp; Inputs</div>
+    <div style='background:#FFFFFF;border-radius:0 0 2px 2px;box-shadow:0 1px 4px rgba(0,0,0,.08);
+                display:grid;grid-template-columns:repeat(3,1fr);gap:0'>
+      <div style='padding:12px 16px;border-right:1px solid #EDEBE9;border-bottom:1px solid #EDEBE9'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Medium</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>{medium}</div>
+      </div>
+      <div style='padding:12px 16px;border-right:1px solid #EDEBE9;border-bottom:1px solid #EDEBE9'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Mode</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>{"Heating Only" if not is_hc else "Heating + Cooling"}</div>
+      </div>
+      <div style='padding:12px 16px;border-bottom:1px solid #EDEBE9'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Heating Method</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>{heating_type}</div>
+      </div>
+      <div style='padding:12px 16px;border-right:1px solid #EDEBE9;border-bottom:1px solid #EDEBE9'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Hot Water IN</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>{fi(hot_water_in)} °C</div>
+      </div>
+      <div style='padding:12px 16px;border-right:1px solid #EDEBE9;border-bottom:1px solid #EDEBE9'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Hot Water OUT</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>{fi(hot_water_out)} °C</div>
+      </div>
+      <div style='padding:12px 16px;border-bottom:1px solid #EDEBE9'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Flow Rate</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>{fi(flow_rate)} Kg/Hr</div>
+      </div>
+      <div style='padding:12px 16px;border-right:1px solid #EDEBE9;border-bottom:1px solid #EDEBE9'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Cold Water IN</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>{fi(cold_water_in)} °C</div>
+      </div>
+      <div style='padding:12px 16px;border-right:1px solid #EDEBE9;border-bottom:1px solid #EDEBE9'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Cold Water OUT</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>{fi(cold_water_out) + " °C" if is_hc else "N/A"}</div>
+      </div>
+      <div style='padding:12px 16px;border-bottom:1px solid #EDEBE9'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Process Input Type</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>{process_type}</div>
+      </div>
+      <div style='padding:12px 16px;border-right:1px solid #EDEBE9'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Daily Operating Hours</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>{fi(daily_op_hours)} Hrs</div>
+      </div>
+      <div style='padding:12px 16px;border-right:1px solid #EDEBE9'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Operating Days / Year</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>{fi(op_days)} Days</div>
+      </div>
+      <div style='padding:12px 16px'>
+        <div style='font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#8A8886;margin-bottom:4px'>Steam Cost</div>
+        <div style='font-size:14px;font-weight:600;color:#201F1E'>Rs.{ff(steam_cost)}/Kg {"— " + (fuel_display or co2_fuel or "") if (fuel_display or co2_fuel) else ""}</div>
+      </div>
+    </div>
+  </div>
+  <!-- KPI Row 1 -->
+  <div class='kpi-grid3'>
+    <div class='kpi-card' style='--ac:#118DFF'>
+      <div class='kpi-lbl'>Annual Savings</div>
+      <div class='kpi-val'>Rs.{fi(annual_savings)}</div>
+      <div class='kpi-unit'>Rs. / Year</div>
+      <div class='kpi-tag' style='background:#DEEEFF;color:#0063B1'>NET BENEFIT</div>
+    </div>
+    <div class='kpi-card' style='--ac:#107C10'>
+      <div class='kpi-lbl'>CO₂ Mitigation</div>
+      <div class='kpi-val'>{co2_card_val}</div>
+      <div class='kpi-unit'>Tonnes / Year</div>
+      <div class='kpi-tag' style='background:#E6F4EA;color:#107C10'>ENVIRONMENT</div>
+    </div>
+    <div class='kpi-card' style='--ac:#00B7C3'>
+      <div class='kpi-lbl'>Steam Savings</div>
+      <div class='kpi-val'>{ff(steam_savings_yr_tonnes)}</div>
+      <div class='kpi-unit'>Tonnes / Year</div>
+      <div class='kpi-tag' style='background:#D9F4F5;color:#006B6E'>STEAM SAVED</div>
+    </div>
+  </div>
+  <!-- KPI Row 2 -->
+  <div class='kpi-grid2'>
+    <div class='kpi-card' style='--ac:#E66C37'>
+      <div class='kpi-lbl'>Heat Pump Capacity</div>
+      <div class='kpi-val'>{fi(heat_pump_capacity)} kWth</div>
+      <div class='kpi-unit'>Required</div>
+      <div class='kpi-tag' style='background:#FDEBD7;color:#8C3800'>REQUIRED</div>
+    </div>
+    <div class='kpi-card' style='--ac:#6B4CC0'>
+      <div class='kpi-lbl'>Equivalent Forestation</div>
+      <div class='kpi-val'>{fore_card_val}</div>
+      <div class='kpi-unit'>{'≈ ' + fi(equivalent_trees) + ' trees' if has_co2 else 'Select fuel type for data'}</div>
+      <div class='kpi-tag' style='background:#EDE7F6;color:#4527A0'>ECO IMPACT</div>
+    </div>
+  </div>
+  <!-- KPI Row 3 -->
+  <div class='sm-grid'>
+    <div class='sm-card' style='--ac:#118DFF'>
+      <div class='sm-lbl'>Fuel Savings (A)</div>
+      <div class='sm-val'>Rs.{fi(hourly_steam_savings_A)}/hr</div>
+    </div>
+    <div class='sm-card' style='--ac:#E66C37'>
+      <div class='sm-lbl'>Elec. Cost (B)</div>
+      <div class='sm-val'>Rs.{fi(hourly_op_cost_B)}/hr</div>
+    </div>
+    <div class='sm-card' style='--ac:#F2C811'>
+      <div class='sm-lbl'>Net Savings / Hr</div>
+      <div class='sm-val'>Rs.{fi(net_savings_hr)}/hr</div>
+    </div>
+  </div>
+  {co2_section_html}
+  <table>
+    <tr><th>Parameter</th><th class='r'>Value</th><th class='r'>Unit</th></tr>
+    <tr><td colspan='3' class='sec-lbl'>Inputs</td></tr>
+    <tr><td>Hot Water IN / OUT</td><td class='r'>{fi(hot_water_in)} / {fi(hot_water_out)}</td><td class='u'>°C</td></tr>
+    <tr><td>Flow Rate</td><td class='r'>{fi(flow_rate)}</td><td class='u'>Kg/Hr</td></tr>
+    <tr><td>{cold_lbl}</td><td class='r'>{cold_val}</td><td class='u'>°C</td></tr>
+    <tr><td>Operating Schedule</td><td class='r'>{fi(daily_op_hours)} hrs x {fi(op_days)} days</td><td class='u'></td></tr>
+    <tr><td><b>Total Operating Hours</b></td><td class='r' style='color:#0063B1;font-weight:600'>{fi(daily_op_hours)} × {fi(op_days)} = {fi(daily_op_hours * op_days)}</td><td class='u'>hrs/year</td></tr>
+    <tr><td>Steam Cost {fuel_info}</td><td class='r'>Rs.{ff(steam_cost)}</td><td class='u'>Rs./Kg</td></tr>
+    <tr><td>Electricity Tariff</td><td class='r'>Rs.{ff(electricity_tariff)}</td><td class='u'>Rs./kWh</td></tr>
+    <tr><td colspan='3' class='sec-lbl'>Fuel Savings</td></tr>
+    <tr><td>Heat Duty</td><td class='r'>{fi(heat_duty_kcal)}</td><td class='u'>kCal/Hr</td></tr>
+    <tr><td>Steam Required</td><td class='r'>{ff(steam_required)}</td><td class='u'>Kg/Hr</td></tr>
+    <tr><td>Heating COP</td><td class='r'>{ff(cop)}</td><td class='u'></td></tr>
+    <tr><td><b>Hourly Steam Savings (A)</b></td><td class='r' style='color:#0063B1;font-weight:600'>Rs.{fi(hourly_steam_savings_A)}</td><td class='u'>Rs./Hr</td></tr>
+    <tr><td colspan='3' class='sec-lbl'>Electricity Operating Cost</td></tr>
+    <tr><td>Electrical Power</td><td class='r'>{fi(electrical_power)}</td><td class='u'>kWhe</td></tr>
+    <tr><td><b>Hourly Operating Cost (B)</b></td><td class='r' style='color:#8C3800;font-weight:600'>Rs.{fi(hourly_op_cost_B)}</td><td class='u'>Rs./Hr</td></tr>
+    {"<tr><td colspan='3' class='sec-lbl'>Cooling Electricity Reduction</td></tr><tr><td>Cooling Output</td><td class='r'>" + fi(cooling_output_kw) + "</td><td class='u'>kWth</td></tr><tr><td>Hourly Cooling Savings (C)</td><td class='r' style='color:#006B6E;font-weight:600'>Rs." + fi(hourly_cooling_savings_C) + "</td><td class='u'>Rs./Hr</td></tr>" if is_hc else ""}
+    <tr><td colspan='3' class='sec-lbl'>Net Savings</td></tr>
+    <tr><td><b>{net_lbl}</b></td><td class='r' style='color:#6B4900;font-weight:600'>Rs.{fi(net_savings_hr)}</td><td class='u'>Rs./Hr</td></tr>
+    <tr><td><b>Annual Savings</b></td><td class='r' style='color:#6B4900;font-weight:700;font-size:14px'>Rs.{fi(annual_savings)}</td><td class='u'>Rs./Year</td></tr>
+    {"<tr><td colspan='3' class='sec-lbl'>CO₂ Mitigation</td></tr><tr><td>Fuel Type</td><td class='r'>" + co2_fuel + "</td><td class='u'></td></tr><tr><td>Tonnes of CO₂ Mitigated</td><td class='r' style='color:#107C10;font-weight:600'>" + ff(tonnes_co2) + "</td><td class='u'>T/yr</td></tr><tr><td>Equivalent Tree Plantation</td><td class='r' style='color:#107C10;font-weight:600'>" + fi(equivalent_trees) + "</td><td class='u'>nos.</td></tr><tr><td>Equivalent Forestation</td><td class='r' style='color:#4527A0;font-weight:600'>" + ff(equivalent_forestation) + "</td><td class='u'>ACRs</td></tr>" if has_co2 else ""}
+  </table>
+  <div class='footer'>
+    <strong>Forbes Marshall</strong> &nbsp;|&nbsp; Heat Pump Savings Calculator &nbsp;|&nbsp; This is a reference calculator. For precise calculations, contact the authorised owner.
+  </div>
+</div>
+</body></html>"""
+
+    import base64
+    b64     = base64.b64encode(report_body.encode()).decode()
+    dl_html = (f"<a href='data:text/html;base64,{b64}' download='ForbesMarshall_HeatPump_Report.html' "
+               f"style='display:inline-block;background:#118DFF;color:#FFF;font-family:Segoe UI,sans-serif;"
+               f"font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;"
+               f"padding:8px 20px;border-radius:2px;text-decoration:none;margin-top:12px;"
+               f"box-shadow:0 1px 4px rgba(0,0,0,.15)'>Download Report (HTML)</a>")
+
+    return kpi + dl_html, detail_html, steam_html
+
+
+CSS = """
+footer, .built-with, .show-api { display: none !important; }
+.input-panel  { padding: 0 16px 20px !important; min-height: 100vh; }
+.output-panel { padding: 16px !important; }
+.pbi-divider  { border: none; border-top: 1px solid #e5e7eb; margin: 14px 0 10px; }
+.pbi-sec {
+  font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+  padding: 12px 0 8px; border-bottom: 1px solid #e5e7eb; margin-bottom: 10px;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+}
+"""
+
+with gr.Blocks(css=CSS, title="Heat Pump Savings Calculator", theme=gr.themes.Default()) as demo:
+
+    gr.HTML("""
+    <div style='background:#1B1A19;border-bottom:1px solid #323130;
+                padding:0 16px;height:40px;display:flex;align-items:center;gap:10px;
+                position:sticky;top:0;z-index:100'>
+      <svg width='18' height='18' viewBox='0 0 24 24' fill='none'>
+        <rect x='2'  y='12' width='4' height='10' rx='1' fill='#F2C811'/>
+        <rect x='8'  y='7'  width='4' height='15' rx='1' fill='#E66C37'/>
+        <rect x='14' y='3'  width='4' height='19' rx='1' fill='#118DFF'/>
+        <rect x='20' y='9'  width='2' height='13' rx='1' fill='#00B7C3'/>
+      </svg>
+      <span style='font-size:14px;font-weight:600;color:#F3F2F1 !important;font-family:Segoe UI,system-ui,sans-serif'>
+        Heat Pump Savings Calculator
+      </span>
+      <div style='height:16px;width:1px;background:#3B3A39;margin:0 4px'></div>
+      <span style='font-size:12px;color:#A19F9D !important;font-family:Segoe UI,system-ui,sans-serif'>
+        Thermodynamic ROI Analysis
+      </span>
+      <div style='height:16px;width:1px;background:#3B3A39;margin:0 4px'></div>
+      <span style='font-size:12px;font-weight:600;color:#F2C811 !important;font-family:Segoe UI,system-ui,sans-serif;letter-spacing:.04em'>
+        Forbes Marshall
+      </span>
+      <div style='margin-left:auto;display:flex;align-items:center;gap:6px'>
+        <div style='width:8px;height:8px;border-radius:50%;background:#107C10'></div>
+        <span style='font-size:11px;color:#A19F9D !important;font-family:Segoe UI,system-ui,sans-serif'>Excel-verified</span>
+      </div>
+    </div>
+    """)
+
+    gr.HTML("""
+    <div style='background:#FFF4CE;border-bottom:1px solid #F2C811;padding:7px 20px;
+                display:flex;align-items:center;gap:8px'>
+      <svg width='14' height='14' viewBox='0 0 16 16' fill='none'>
+        <path d='M8 1L15 14H1L8 1Z' stroke='#8C5E00' stroke-width='1.5' fill='none'/>
+        <line x1='8' y1='6' x2='8' y2='10' stroke='#8C5E00' stroke-width='1.5' stroke-linecap='round'/>
+        <circle cx='8' cy='12' r='.7' fill='#8C5E00'/>
+      </svg>
+      <span style='font-size:11px;color:#603000;font-family:Segoe UI,system-ui,sans-serif'>
+        <strong>Reference Calculator</strong> — Results are indicative only. For precise calculations and project proposals, contact the authorised owner.
+      </span>
+    </div>
+    """)
+
+    with gr.Row():
+
+        with gr.Column(scale=4, min_width=280, elem_classes=["input-panel"]):
+            gr.HTML("<div style='height:14px'></div>")
+
+            gr.HTML("<div class='pbi-sec'>System Configuration</div>")
+            medium       = gr.Radio(["Air", "Water"], label="Heat Pump Medium", value="Water", elem_classes=["pbi-radio"])
+            gr.HTML("<div style='height:6px'></div>")
+            mode         = gr.Radio(["Heating Only", "Heating + Cooling"], label="Mode", value="Heating Only", elem_classes=["pbi-radio"])
+            gr.HTML("<div style='height:6px'></div>")
+            process_type = gr.Radio(["Per Hour", "Per Day"], label="Process Input Type", value="Per Hour", elem_classes=["pbi-radio"])
+            gr.HTML("<div style='height:6px'></div>")
+            heating_type = gr.Radio(["Indirect Heating", "Direct Steam Injection"], label="Heating Method", value="Indirect Heating", elem_classes=["pbi-radio"])
+
+            gr.HTML("<hr class='pbi-divider'><div class='pbi-sec'>Temperature &amp; Flow</div>")
+            with gr.Row():
+                hot_water_in  = gr.Number(label="Hot Water IN  20–75 °C",  value=50,   min_width=100)
+                hot_water_out = gr.Number(label="Hot Water OUT  25–80 °C", value=60,   min_width=100)
+            gr.HTML("<div style='height:6px'></div>")
+            with gr.Row():
+                flow_rate     = gr.Number(label="Flow Rate (Kg/Hr or Kg/Day)", value=1000, min_width=100)
+                cold_water_in = gr.Number(label="Cold Water IN  10–40 °C",     value=30,   min_width=100)
+            gr.HTML("<div style='height:6px'></div>")
+            cold_water_out = gr.Number(label="Cold Water OUT  7–40 °C  —  H+C only", value=25, visible=False)
+
+            gr.HTML("<hr class='pbi-divider'><div class='pbi-sec'>Operating Schedule</div>")
+            with gr.Row():
+                daily_op_hours = gr.Number(label="Daily Operating Hours  (max 24)", value=22,  min_width=100)
+                op_days        = gr.Number(label="Operating Days / Year  (max 360)", value=340, min_width=100)
+            total_hours_display = gr.HTML(
+                "<div style='font-size:12px;color:#374151;background:#F3F4F6;border-radius:4px;"
+                "padding:7px 12px;margin-top:6px;font-family:Segoe UI,system-ui,sans-serif'>"
+                "⏱ <b>22 hrs × 340 days = 7,480 hrs/year</b></div>"
+            )
+
+            gr.HTML("<hr class='pbi-divider'><div class='pbi-sec'>Cost Inputs</div>")
+            steam_cost_known  = gr.Radio(["I know the steam cost", "Auto-calculate from fuel type"],
+                                         label="Steam Cost Method", value="I know the steam cost", elem_classes=["pbi-radio"])
+            gr.HTML("<div style='height:6px'></div>")
+            steam_cost_manual = gr.Number(label="Steam Cost (Rs./Kg)", value=4.5, visible=True)
+            fuel_type         = gr.Dropdown(list(FUEL_TABLE.keys()), label="Fuel Type (auto-calculates steam cost)", visible=False, elem_classes=["pbi-dropdown"])
+            gr.HTML("<div style='height:6px'></div>")
+            # shown only when user knows steam cost — for CO2 calculation
+            fuel_type_co2     = gr.Dropdown(list(FUEL_TABLE.keys()), label="Fuel Type (optional — for CO₂ calculation)", visible=True, elem_classes=["pbi-dropdown"])
+            gr.HTML("<div style='height:6px'></div>")
+            with gr.Row():
+                electricity_tariff = gr.Number(label="Electricity Tariff (Rs./kWh)", value=9,    min_width=100)
+                ikw_tr             = gr.Number(label="IKW/TR  (H+C only)",            value=0.95, min_width=100, visible=False)
+
+            gr.HTML("<div style='height:14px'></div>")
+            calc_btn = gr.Button("APPLY", variant="primary")
+            gr.HTML("<div style='height:10px'></div>")
+
+        with gr.Column(scale=8, min_width=500, elem_classes=["output-panel"]):
+            summary_out     = gr.HTML()
+            detail_out      = gr.HTML()
+            gr.HTML("<div style='height:10px'></div>")
+            gr.HTML("""
+            <div style='font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+                        padding:10px 0 8px;border-bottom:1px solid #e5e7eb;margin-bottom:8px;
+                        font-family:Segoe UI,system-ui,sans-serif'>
+              Fuel Steam Cost &amp; CO₂ Reference
+            </div>""")
+            steam_table_out = gr.HTML()
+
+    # callbacks
+    def upd_mode(med):
+        return gr.update(visible=(med == "Water"))
+
+    def upd_cooling(med, mod):
+        show = (med == "Water" and mod == "Heating + Cooling")
+        return gr.update(visible=show), gr.update(visible=show)
+
+    def upd_steam(choice):
+        is_manual = (choice == "I know the steam cost")
+        return (gr.update(visible=is_manual),
+                gr.update(visible=not is_manual),
+                gr.update(visible=is_manual))
+
+    def upd_total_hours(hrs, days):
+        try:
+            h = float(hrs or 0)
+            d = float(days or 0)
+            total = int(round(h * d))
+            return (f"<div style='font-size:12px;color:#374151;background:#F3F4F6;border-radius:4px;"
+                    f"padding:7px 12px;margin-top:6px;font-family:Segoe UI,system-ui,sans-serif'>"
+                    f"⏱ <b>{h:g} hrs × {d:g} days = {total:,} hrs / year</b></div>")
+        except:
+            return ""
+
+    medium.change(upd_mode,    [medium],       [mode])
+    medium.change(upd_cooling, [medium, mode], [cold_water_out, ikw_tr])
+    mode.change(upd_cooling,   [medium, mode], [cold_water_out, ikw_tr])
+    steam_cost_known.change(upd_steam, [steam_cost_known], [steam_cost_manual, fuel_type, fuel_type_co2])
+    daily_op_hours.change(upd_total_hours, [daily_op_hours, op_days], [total_hours_display])
+    op_days.change(upd_total_hours,        [daily_op_hours, op_days], [total_hours_display])
+
+    calc_btn.click(
+        calculate,
+        inputs=[medium, mode, process_type, heating_type,
+                hot_water_in, hot_water_out, flow_rate,
+                cold_water_in, cold_water_out,
+                daily_op_hours, op_days,
+                steam_cost_known, steam_cost_manual, fuel_type,
+                fuel_type_co2,
+                electricity_tariff, ikw_tr],
+        outputs=[summary_out, detail_out, steam_table_out]
+    )
+
+if __name__ == "__main__":
+    demo.launch()
