@@ -364,9 +364,11 @@ def calculate(medium, mode, process_type, heating_type,
   <span class='nav-sub'>Reference Report</span>
 </div>
 <div class='canvas'>
+
   <div class='note'>
     This is a reference report for indicative purposes only. For precise calculations and project proposals, please contact the authorised owner.
   </div>
+
   <!-- Inputs Summary -->
   <div style='margin-bottom:20px'>
     <div style='font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
@@ -424,6 +426,7 @@ def calculate(medium, mode, process_type, heating_type,
       </div>
     </div>
   </div>
+
   <!-- KPI Row 1 -->
   <div class='kpi-grid3'>
     <div class='kpi-card' style='--ac:#118DFF'>
@@ -445,6 +448,7 @@ def calculate(medium, mode, process_type, heating_type,
       <div class='kpi-tag' style='background:#D9F4F5;color:#006B6E'>STEAM SAVED</div>
     </div>
   </div>
+
   <!-- KPI Row 2 -->
   <div class='kpi-grid2'>
     <div class='kpi-card' style='--ac:#E66C37'>
@@ -460,6 +464,7 @@ def calculate(medium, mode, process_type, heating_type,
       <div class='kpi-tag' style='background:#EDE7F6;color:#4527A0'>ECO IMPACT</div>
     </div>
   </div>
+
   <!-- KPI Row 3 -->
   <div class='sm-grid'>
     <div class='sm-card' style='--ac:#118DFF'>
@@ -475,7 +480,9 @@ def calculate(medium, mode, process_type, heating_type,
       <div class='sm-val'>Rs.{fi(net_savings_hr)}/hr</div>
     </div>
   </div>
+
   {co2_section_html}
+
   <table>
     <tr><th>Parameter</th><th class='r'>Value</th><th class='r'>Unit</th></tr>
     <tr><td colspan='3' class='sec-lbl'>Inputs</td></tr>
@@ -500,6 +507,7 @@ def calculate(medium, mode, process_type, heating_type,
     <tr><td><b>Annual Savings</b></td><td class='r' style='color:#6B4900;font-weight:700;font-size:14px'>Rs.{fi(annual_savings)}</td><td class='u'>Rs./Year</td></tr>
     {"<tr><td colspan='3' class='sec-lbl'>CO₂ Mitigation</td></tr><tr><td>Fuel Type</td><td class='r'>" + co2_fuel + "</td><td class='u'></td></tr><tr><td>Tonnes of CO₂ Mitigated</td><td class='r' style='color:#107C10;font-weight:600'>" + ff(tonnes_co2) + "</td><td class='u'>T/yr</td></tr><tr><td>Equivalent Tree Plantation</td><td class='r' style='color:#107C10;font-weight:600'>" + fi(equivalent_trees) + "</td><td class='u'>nos.</td></tr><tr><td>Equivalent Forestation</td><td class='r' style='color:#4527A0;font-weight:600'>" + ff(equivalent_forestation) + "</td><td class='u'>ACRs</td></tr>" if has_co2 else ""}
   </table>
+
   <div class='footer'>
     <strong>Forbes Marshall</strong> &nbsp;|&nbsp; Heat Pump Savings Calculator &nbsp;|&nbsp; This is a reference calculator. For precise calculations, contact the authorised owner.
   </div>
@@ -529,7 +537,7 @@ footer, .built-with, .show-api { display: none !important; }
 }
 """
 
-with gr.Blocks(css=CSS, title="Heat Pump Savings Calculator", theme=gr.themes.Default()) as demo:
+with gr.Blocks(title="Heat Pump Savings Calculator") as demo:
 
     gr.HTML("""
     <div style='background:#1B1A19;border-bottom:1px solid #323130;
@@ -683,4 +691,9 @@ with gr.Blocks(css=CSS, title="Heat Pump Savings Calculator", theme=gr.themes.De
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(
+        css=CSS,
+        theme=gr.themes.Default(),
+        server_name="0.0.0.0",
+        server_port=10000
+    )
