@@ -114,7 +114,7 @@ def calculate(medium, mode, process_type, heating_type,
     if (hot_water_out - cold_water_in) == 0:
         return _err("(Hot Water Out - Cold Water In) = 0, COP undefined."), "", ""
 
-    cop_factor       = 0.35 if hot_water_out <= 65 else 0.32
+    cop_factor       = 0.34 if hot_water_out <= 65 else 0.34
     cop              = ((hot_water_out + 273) / (hot_water_out - cold_water_in)) * cop_factor
     electrical_power = heat_duty_kwth / cop
     hourly_op_cost_B = electrical_power * electricity_tariff
