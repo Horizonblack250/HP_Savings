@@ -571,37 +571,9 @@ footer, .built-with, .show-api { display: none !important; }
   padding: 12px 0 8px; border-bottom: 1px solid #e5e7eb; margin-bottom: 10px;
   font-family: 'Segoe UI', system-ui, sans-serif;
 }
-
-/* force light regardless of system theme */
-html, html.dark, .dark {
-  --body-background-fill: #ffffff !important;
-  --background-fill-primary: #ffffff !important;
-  --background-fill-secondary: #f9fafb !important;
-  --block-background-fill: #ffffff !important;
-  --input-background-fill: #ffffff !important;
-  --body-text-color: #111827 !important;
-  --block-label-text-color: #374151 !important;
-  --block-border-color: #e5e7eb !important;
-  --input-border-color: #d1d5db !important;
-  --border-color-primary: #e5e7eb !important;
-  --color-accent: #2563eb !important;
-  --button-primary-background-fill: #2563eb !important;
-  --button-primary-text-color: #ffffff !important;
-  --neutral-800: #1f2937 !important;
-  --neutral-700: #374151 !important;
-  --neutral-600: #4b5563 !important;
-  --neutral-400: #9ca3af !important;
-  --neutral-100: #f3f4f6 !important;
-  --neutral-50: #f9fafb !important;
-}
 """
 
-with gr.Blocks(title="Heat Pump Savings Calculator", js="""
-function() {
-    document.documentElement.classList.remove('dark');
-    document.documentElement.classList.add('light');
-}
-""") as demo:
+with gr.Blocks(title="Heat Pump Savings Calculator") as demo:
 
     gr.HTML("""
     <div style='background:#1B1A19;border-bottom:1px solid #323130;
