@@ -25,6 +25,25 @@ def check_bounds(label, value):
         return f"{label} is out of range — valid range is {lo} to {hi}."
     return None
 
+# ── AIR SOURCE: ambient → cold water IN interpolation ─────────────────────────
+AIR_INTERP = {15: 10, 20: 15, 25: 18, 30: 21, 35: 24, 40: 27}
+
+def interp_cold_water_in(amb_temp):
+    """Linear interpolation of Cold Water IN from ambient temperature."""
+    pts = sorted(AIR_INTERP.items())
+    amb_temps = [p[0] for p in pts]
+    cw_temps  = [p[1] for p in pts]
+    if amb_temp <= amb_temps[0]:
+        return cw_temps[0]
+    if amb_temp >= amb_temps[-1]:
+        return cw_temps[-1]
+    for i in range(len(pts) - 1):
+        t0, c0 = pts[i]
+        t1, c1 = pts[i + 1]
+        if t0 <= amb_temp <= t1:
+            return round(c0 + (c1 - c0) * (amb_temp - t0) / (t1 - t0), 2)
+    return cw_temps[-1]
+
 def get_steam_cost_from_fuel(fuel_name):
     f = FUEL_TABLE[fuel_name]
     return round(f["rate"] / f["sf_ratio"], 4)
@@ -38,6 +57,7 @@ def _err(msg):
 def calculate(medium, mode, process_type, heating_type,
               hot_water_in, hot_water_out, flow_rate,
               cold_water_in, cold_water_out,
+              amb_temp,
               daily_op_hours, op_days,
               steam_cost_known, steam_cost_manual, fuel_type,
               fuel_type_co2,
@@ -47,21 +67,37 @@ def calculate(medium, mode, process_type, heating_type,
         hot_water_in       = float(hot_water_in)
         hot_water_out      = float(hot_water_out)
         flow_rate          = float(flow_rate)
-        cold_water_in      = float(cold_water_in)
         daily_op_hours     = float(daily_op_hours)
         op_days            = float(op_days)
         electricity_tariff = float(electricity_tariff)
     except (ValueError, TypeError):
         return _err("Please fill in all required numeric fields."), "", ""
 
+    # ── Air source: auto-derive cold_water_in from ambient temp ───────────────
+    if medium == "Air":
+        try:
+            amb_temp = float(amb_temp)
+        except (ValueError, TypeError):
+            return _err("Please enter a valid Ambient Temperature for Air source."), "", ""
+        cold_water_in = interp_cold_water_in(amb_temp)
+    else:
+        try:
+            cold_water_in = float(cold_water_in)
+        except (ValueError, TypeError):
+            return _err("Please fill in all required numeric fields."), "", ""
+
     for label, val in [
         ("Hot Water IN (°C)",     hot_water_in),
         ("Hot Water OUT (°C)",    hot_water_out),
-        ("Cold Water IN (°C)",    cold_water_in),
         ("Daily Operating Hours", daily_op_hours),
         ("Operating Days / Year", op_days),
     ]:
         err = check_bounds(label, val)
+        if err:
+            return _err(err), "", ""
+
+    if medium == "Water":
+        err = check_bounds("Cold Water IN (°C)", cold_water_in)
         if err:
             return _err(err), "", ""
 
@@ -114,7 +150,7 @@ def calculate(medium, mode, process_type, heating_type,
     if (hot_water_out - cold_water_in) == 0:
         return _err("(Hot Water Out - Cold Water In) = 0, COP undefined."), "", ""
 
-    cop_factor       = 0.34 if hot_water_out <= 65 else 0.34
+    cop_factor       = 0.35 if hot_water_out <= 65 else 0.32
     cop              = ((hot_water_out + 273) / (hot_water_out - cold_water_in)) * cop_factor
     electrical_power = heat_duty_kwth / cop
     hourly_op_cost_B = electrical_power * electricity_tariff
@@ -596,6 +632,9 @@ with gr.Blocks(title="Heat Pump Savings Calculator") as demo:
             heating_type = gr.Radio(["Indirect Heating", "Direct Steam Injection"], label="Heating Method", value="Indirect Heating", elem_classes=["pbi-radio"])
 
             gr.HTML("<hr class='pbi-divider'><div class='pbi-sec'>Temperature &amp; Flow</div>")
+            amb_temp      = gr.Number(label="Ambient Temperature (°C)  — Air source only", value=30, visible=False)
+            amb_temp_info = gr.HTML(visible=False)
+            gr.HTML("<div style='height:6px'></div>")
             with gr.Row():
                 hot_water_in  = gr.Number(label="Hot Water IN  20–75 °C",  value=50,   min_width=100)
                 hot_water_out = gr.Number(label="Hot Water OUT  25–80 °C", value=60,   min_width=100)
@@ -650,6 +689,24 @@ with gr.Blocks(title="Heat Pump Savings Calculator") as demo:
     def upd_mode(med):
         return gr.update(visible=(med == "Water"))
 
+    def upd_medium(med):
+        is_air = (med == "Air")
+        return (gr.update(visible=is_air),       # amb_temp input
+                gr.update(visible=is_air),        # amb_temp_info
+                gr.update(visible=not is_air))    # cold_water_in (manual, Water only)
+
+    def upd_amb_temp(amb, med):
+        if med != "Air":
+            return "", gr.update()
+        try:
+            cw = interp_cold_water_in(float(amb))
+            info = (f"<div style='font-size:12px;color:#374151;background:#F3F4F6;border-radius:4px;"
+                    f"padding:7px 12px;margin-top:4px;font-family:Segoe UI,system-ui,sans-serif'>"
+                    f"🌡 Ambient {float(amb):g}°C → <b>Cold Water IN auto-set to {cw}°C</b> (interpolated)</div>")
+            return info, gr.update(value=cw)
+        except:
+            return "", gr.update()
+
     def upd_cooling(med, mod):
         show = (med == "Water" and mod == "Heating + Cooling")
         return gr.update(visible=show), gr.update(visible=show)
@@ -671,9 +728,11 @@ with gr.Blocks(title="Heat Pump Savings Calculator") as demo:
         except:
             return ""
 
-    medium.change(upd_mode,    [medium],       [mode])
-    medium.change(upd_cooling, [medium, mode], [cold_water_out, ikw_tr])
-    mode.change(upd_cooling,   [medium, mode], [cold_water_out, ikw_tr])
+    medium.change(upd_medium,   [medium],              [amb_temp, amb_temp_info, cold_water_in])
+    medium.change(upd_mode,     [medium],              [mode])
+    medium.change(upd_cooling,  [medium, mode],        [cold_water_out, ikw_tr])
+    mode.change(upd_cooling,    [medium, mode],        [cold_water_out, ikw_tr])
+    amb_temp.change(upd_amb_temp, [amb_temp, medium],  [amb_temp_info, cold_water_in])
     steam_cost_known.change(upd_steam, [steam_cost_known], [steam_cost_manual, fuel_type, fuel_type_co2])
     daily_op_hours.change(upd_total_hours, [daily_op_hours, op_days], [total_hours_display])
     op_days.change(upd_total_hours,        [daily_op_hours, op_days], [total_hours_display])
@@ -683,6 +742,7 @@ with gr.Blocks(title="Heat Pump Savings Calculator") as demo:
         inputs=[medium, mode, process_type, heating_type,
                 hot_water_in, hot_water_out, flow_rate,
                 cold_water_in, cold_water_out,
+                amb_temp,
                 daily_op_hours, op_days,
                 steam_cost_known, steam_cost_manual, fuel_type,
                 fuel_type_co2,
