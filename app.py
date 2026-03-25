@@ -573,7 +573,12 @@ footer, .built-with, .show-api { display: none !important; }
 }
 """
 
-with gr.Blocks(title="Heat Pump Savings Calculator") as demo:
+with gr.Blocks(title="Heat Pump Savings Calculator", js="""
+function() {
+    document.documentElement.classList.remove('dark');
+    document.documentElement.classList.add('light');
+}
+""") as demo:
 
     gr.HTML("""
     <div style='background:#1B1A19;border-bottom:1px solid #323130;
